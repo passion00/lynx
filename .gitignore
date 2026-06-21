@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Lynx data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# llama.cpp source/build/model cache
+llama.cpp/
+
+# OS/editor files
+.DS_Store
+*.swp
+*.bak
