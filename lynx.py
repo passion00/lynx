@@ -1,136 +1,62 @@
 import atexit
-import subprocess
-import time
-from pathlib import Path
+import sys
+
+import requests
+
 from lynx_core.active_memory import ActiveMemory
 from lynx_core.database import LynxDatabase
-import sys
-import requests
+from lynx_core.memory_retriever import retrieve_relevant_context
+from lynx_core.conversation_summarizer import summarize_and_store_current_conversation
+from lynx_core.model_server import (
+    CHAT_URL,
+    MODEL_NAME,
+    start_llama_server,
+    stop_llama_server,
+)
 
 
 # ===== Lynx configuration =====
 
-LLAMA_CPP_DIR = Path.home() / "lynx" / "llama.cpp"
-LLAMA_SERVER_BIN = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
-
-HOST = "127.0.0.1"
-PORT = 8081
-
-SERVER_URL = f"http://{HOST}:{PORT}"
-CHAT_URL = f"{SERVER_URL}/v1/chat/completions"
-
-MODEL_NAME = "llmware/qwen3-4b-instruct-gguf:Q4_K_M"
-
-SERVER_COMMAND = [
-    str(LLAMA_SERVER_BIN),
-    "-hf", MODEL_NAME,
-    "--host", HOST,
-    "--port", str(PORT),
-    "-c", "4096",
-    "-ngl", "0",
-]
 SYSTEM_PROMPT = (
     "You are Lynx, a local AI assistant. "
     "Answer clearly, directly, and helpfully."
 )
 
-server_process: subprocess.Popen | None = None
-
-
-def is_server_running() -> bool:
-    """Check whether llama-server is already responding."""
-    try:
-        response = requests.get(f"{SERVER_URL}/health", timeout=2)
-        return response.status_code < 500
-    except requests.RequestException:
-        return False
-
-
-def start_llama_server() -> None:
-    """Start llama-server if it is not already running."""
-    global server_process
-
-    if is_server_running():
-        print("Lynx model server is already running.")
-        return
-
-    if not LLAMA_SERVER_BIN.exists():
-        raise FileNotFoundError(
-            f"Could not find llama-server at:\n{LLAMA_SERVER_BIN}\n\n"
-            "Make sure llama.cpp finished building successfully."
-        )
-
-    print("Starting Lynx model server...")
-    print("This may take a long time on first run if the model is being downloaded.")
-
-    log_file = open(Path.home() / "lynx" / "llama_server.log", "a")
-
-    server_process = subprocess.Popen(
-        SERVER_COMMAND,
-        cwd=str(LLAMA_CPP_DIR),
-        stdout=log_file,
-        stderr=log_file,
-        text=True,
-    )
-
-    seconds_waited = 0
-
-    # Wait forever until the server becomes available,
-    # unless llama-server crashes.
-    while True:
-        if is_server_running():
-            print("Lynx model server is ready.")
-            return
-
-        if server_process.poll() is not None:
-            raise RuntimeError(
-                "llama-server stopped unexpectedly. Check this log file:\n"
-                f"{Path.home() / 'lynx' / 'llama_server.log'}"
-            )
-
-        time.sleep(1)
-        seconds_waited += 1
-
-        if seconds_waited % 30 == 0:
-            print("Still waiting for Lynx model server...")
-
-def stop_llama_server() -> None:
-    """Stop the llama-server process if this Python program started it."""
-    global server_process
-
-    if server_process is None:
-        return
-
-    if server_process.poll() is None:
-        print("\nStopping Lynx model server...")
-        server_process.terminate()
-
-        try:
-            server_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server_process.kill()
+TEMPERATURE = 0.4
+ACTIVE_MEMORY_MAX_MESSAGES = 30
+SUMMARY_RETRIEVAL_LIMIT = 30
+SHUTDOWN_SUMMARY_MAX_TOKENS = 250
 
 
 def ask_model(messages: list[dict[str, str]]) -> str:
+    """
+    Send chat messages to the local model server and return the answer.
+    """
+
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
-        "temperature": 0.4,
+        "temperature": TEMPERATURE,
     }
 
     response = requests.post(CHAT_URL, json=payload, timeout=None)
     response.raise_for_status()
 
     data = response.json()
-    return data["choices"][0]["message"]["content"]
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as error:
+        raise RuntimeError(f"Unexpected model response format: {data}") from error
+
 
 def read_user_input(prompt: str = "\nYou: ") -> str:
     """
     Read user input safely.
 
-    This prevents Lynx from crashing if the terminal sends
-    malformed UTF-8 bytes.
+    This prevents Lynx from crashing if the terminal sends malformed UTF-8 bytes.
     """
+
     print(prompt, end="", flush=True)
 
     raw_input = sys.stdin.buffer.readline()
@@ -140,18 +66,53 @@ def read_user_input(prompt: str = "\nYou: ") -> str:
 
     return raw_input.decode("utf-8", errors="replace").strip()
 
+
+def build_messages_for_model(
+    memory: ActiveMemory,
+    recalled_context: str,
+) -> list[dict[str, str]]:
+    """
+    Build the message list sent to the model.
+
+    Retrieved database memory is inserted only into this temporary message list.
+    Active memory remains clean.
+    """
+
+    messages_for_model = memory.get_messages()
+
+    if recalled_context:
+        memory_message = {
+            "role": "system",
+            "content": (
+                "Relevant memory retrieved from previous conversations:\n\n"
+                f"{recalled_context}\n\n"
+                "Use this memory only if it helps answer the user's current message. "
+                "Do not mention the retrieval process unless the user asks about it."
+            ),
+        }
+
+        # Insert after the main system prompt.
+        messages_for_model.insert(1, memory_message)
+
+    return messages_for_model
+
+
 def main() -> None:
     atexit.register(stop_llama_server)
 
     db = None
     conversation_id = None
 
+    # Independent transcript for shutdown summarization.
+    # This does not depend on active memory, trimming, or database retrieval.
+    session_messages_for_summary: list[dict[str, str]] = []
+
     try:
         start_llama_server()
 
         memory = ActiveMemory(
             system_prompt=SYSTEM_PROMPT,
-            max_messages=30,
+            max_messages=ACTIVE_MEMORY_MAX_MESSAGES,
         )
 
         db = LynxDatabase()
@@ -164,18 +125,43 @@ def main() -> None:
 
         while True:
             user_input = read_user_input()
+            command = user_input.lower()
 
-            if user_input.lower() == "kill":
+            if command == "kill":
+                print("Summarizing current conversation before shutdown...")
+                print(
+                    f"Shutdown summary transcript contains "
+                    f"{len(session_messages_for_summary)} messages."
+                )
+
+                try:
+                    summary = summarize_and_store_current_conversation(
+                        db=db,
+                        conversation_id=conversation_id,
+                        active_messages=session_messages_for_summary,
+                        max_summary_tokens=SHUTDOWN_SUMMARY_MAX_TOKENS,
+                    )
+
+                    if summary:
+                        print("\nConversation summary saved:")
+                        print(summary)
+                    else:
+                        print("No conversation content to summarize.")
+
+                except Exception as error:
+                    print(f"\nWarning: Could not summarize conversation: {error}")
+
                 print("Lynx controller stopped.")
                 break
 
-            if user_input.lower() == "clear":
+            if command == "clear":
                 memory.clear()
                 print("Active memory cleared.")
                 continue
 
-            if user_input.lower() == "status":
+            if command == "status":
                 print(f"Active memory contains {memory.message_count()} messages.")
+                print(f"Shutdown summary transcript contains {len(session_messages_for_summary)} messages.")
                 print(f"Current conversation ID: {conversation_id}")
                 print(f"Database path: {db.db_path}")
                 continue
@@ -184,13 +170,35 @@ def main() -> None:
                 continue
 
             try:
+                # Save user message in all three places:
+                # 1. active memory for current-context chat
+                # 2. SQLite for permanent raw archive
+                # 3. session transcript for shutdown summary
                 memory.add_user_message(user_input)
                 db.save_message(conversation_id, "user", user_input)
+                session_messages_for_summary.append(
+                    {"role": "user", "content": user_input}
+                )
 
-                answer = ask_model(memory.get_messages())
+                recalled_context = retrieve_relevant_context(
+                    db=db,
+                    user_message=user_input,
+                    summary_limit=SUMMARY_RETRIEVAL_LIMIT,
+                )
 
+                messages_for_model = build_messages_for_model(
+                    memory=memory,
+                    recalled_context=recalled_context,
+                )
+
+                answer = ask_model(messages_for_model)
+
+                # Save assistant message in all three places.
                 memory.add_assistant_message(answer)
                 db.save_message(conversation_id, "assistant", answer)
+                session_messages_for_summary.append(
+                    {"role": "assistant", "content": answer}
+                )
 
                 print(f"\nLynx: {answer}")
 
@@ -203,6 +211,7 @@ def main() -> None:
         if db is not None and conversation_id is not None:
             db.end_conversation(conversation_id)
             db.close()
+
 
 if __name__ == "__main__":
     main()

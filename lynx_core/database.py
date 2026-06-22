@@ -20,6 +20,23 @@ def current_timestamp() -> str:
 
 
 class LynxDatabase:
+    def save_conversation_summary(self, conversation_id: int, summary: str) -> int:
+        """
+        Save a summary for a conversation.
+        """
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO conversation_summaries
+                (conversation_id, summary, created_at)
+            VALUES (?, ?, ?);
+            """,
+            (conversation_id, summary, current_timestamp()),
+        )
+
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
     def __init__(self, db_path: Path | None = None):
         """
         Create a LynxDatabase object.
@@ -70,6 +87,21 @@ class LynxDatabase:
                 conversation_id INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY (conversation_id)
+                    REFERENCES conversations (id)
+                    ON DELETE CASCADE
+            );
+            """
+        )
+
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                summary TEXT NOT NULL,
                 created_at TEXT NOT NULL,
 
                 FOREIGN KEY (conversation_id)
@@ -177,6 +209,43 @@ class LynxDatabase:
             }
             for row in cursor.fetchall()
         ]
+    def list_recent_summaries(self, limit: int = 30) -> list[dict]:
+        """
+        Return recent conversation summaries.
+
+        These summaries are used as an index for deciding which old
+        conversations may be relevant to the current user message.
+        """
+
+        cursor = self.connection.execute(
+            """
+            SELECT
+                conversation_summaries.id AS summary_id,
+                conversation_summaries.conversation_id AS conversation_id,
+                conversation_summaries.summary AS summary,
+                conversation_summaries.created_at AS created_at,
+                conversations.title AS conversation_title,
+                conversations.started_at AS conversation_started_at
+            FROM conversation_summaries
+            JOIN conversations
+                ON conversation_summaries.conversation_id = conversations.id
+            ORDER BY conversation_summaries.id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+
+        return [
+            {
+                "summary_id": row["summary_id"],
+                "conversation_id": row["conversation_id"],
+                "summary": row["summary"],
+                "created_at": row["created_at"],
+                "conversation_title": row["conversation_title"],
+                "conversation_started_at": row["conversation_started_at"],
+            }
+            for row in cursor.fetchall()
+        ]
 
     def list_recent_conversations(self, limit: int = 10) -> list[dict[str, str]]:
         """
@@ -202,7 +271,40 @@ class LynxDatabase:
             }
             for row in cursor.fetchall()
         ]
+    def list_recent_summaries(self, limit: int = 30) -> list[dict]:
+        """
+        Return recent conversation summaries.
+        """
 
+        cursor = self.connection.execute(
+            """
+            SELECT
+                conversation_summaries.id AS summary_id,
+                conversation_summaries.conversation_id AS conversation_id,
+                conversation_summaries.summary AS summary,
+                conversation_summaries.created_at AS created_at,
+                conversations.title AS conversation_title,
+                conversations.started_at AS conversation_started_at
+            FROM conversation_summaries
+            JOIN conversations
+                ON conversation_summaries.conversation_id = conversations.id
+            ORDER BY conversation_summaries.id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+
+        return [
+            {
+                "summary_id": row["summary_id"],
+                "conversation_id": row["conversation_id"],
+                "summary": row["summary"],
+                "created_at": row["created_at"],
+                "conversation_title": row["conversation_title"],
+                "conversation_started_at": row["conversation_started_at"],
+            }
+            for row in cursor.fetchall()
+        ]
     def close(self) -> None:
         """
         Close the database connection.
