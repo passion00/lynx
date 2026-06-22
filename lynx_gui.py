@@ -44,6 +44,11 @@ from lynx_core.model_server import (
     start_llama_server,
     stop_llama_server,
 )
+from lynx_core.wikipedia_tool import (
+    extract_wikipedia_query,
+    format_wikipedia_context,
+    lookup_wikipedia_summary,
+)
 
 
 SYSTEM_PROMPT = (
@@ -73,25 +78,39 @@ def ask_model(messages: list[dict[str, str]]) -> str:
 def build_messages_for_model(
     active_messages: list[dict[str, str]],
     recalled_context: str,
+    wikipedia_context: str = "",
 ) -> list[dict[str, str]]:
     """
-    Insert retrieved memory into the prompt without polluting active memory.
+    Insert retrieved memory and Wikipedia context into the prompt
+    without polluting active memory.
     """
 
     messages_for_model = list(active_messages)
+    insert_position = 1
+
+    if wikipedia_context:
+        wikipedia_message = {
+            "role": "system",
+            "content": (
+                "Wikipedia information retrieved for the user's current request:"
+                f"{wikipedia_context}"
+                "Use this source information when answering the user's current message. "
+                "Do not claim the information came from memory; it came from Wikipedia."
+            ),
+        }
+        messages_for_model.insert(insert_position, wikipedia_message)
+        insert_position += 1
 
     if recalled_context:
         memory_message = {
             "role": "system",
             "content": (
-                "Relevant memory retrieved from previous conversations:\n\n"
-                f"{recalled_context}\n\n"
+                "Relevant memory retrieved from previous conversations:"
+                f"{recalled_context}"
                 "Use this memory only if it helps answer the user's current message."
             ),
         }
-
-        # Insert after main system prompt.
-        messages_for_model.insert(1, memory_message)
+        messages_for_model.insert(insert_position, memory_message)
 
     return messages_for_model
 
@@ -127,15 +146,39 @@ class SendMessageWorker(QObject):
         self,
         user_message: str,
         active_messages: list[dict[str, str]],
+        conversation_id: int,
     ):
         super().__init__()
         self.user_message = user_message
         self.active_messages = active_messages
+        self.conversation_id = conversation_id
 
     def run(self) -> None:
         try:
             # Use a separate SQLite connection in this worker thread.
             db = LynxDatabase()
+
+            wikipedia_context = ""
+            wikipedia_query = extract_wikipedia_query(self.user_message)
+
+            if wikipedia_query:
+                wikipedia_result = lookup_wikipedia_summary(wikipedia_query)
+
+                if wikipedia_result is None:
+                    wikipedia_context = (
+                        f"No Wikipedia article summary was found for: {wikipedia_query}"
+                    )
+                else:
+                    wikipedia_context = format_wikipedia_context(wikipedia_result)
+
+                    db.save_web_source(
+                        source_type="wikipedia",
+                        title=wikipedia_result.title,
+                        url=wikipedia_result.url,
+                        query=wikipedia_result.query,
+                        summary=wikipedia_result.summary,
+                        conversation_id=self.conversation_id,
+                    )
 
             recalled_context = retrieve_relevant_context(
                 db=db,
@@ -148,6 +191,7 @@ class SendMessageWorker(QObject):
             messages_for_model = build_messages_for_model(
                 active_messages=self.active_messages,
                 recalled_context=recalled_context,
+                wikipedia_context=wikipedia_context,
             )
 
             answer = ask_model(messages_for_model)
@@ -347,6 +391,7 @@ class LynxMainWindow(QMainWindow):
         self.worker = SendMessageWorker(
             user_message=user_message,
             active_messages=active_messages,
+            conversation_id=self.conversation_id,
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -447,14 +492,17 @@ class LynxMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """
-        Window close button behaves like Kill.
+        Prevent accidental window closing.
+
+        The user must use the Kill button so Lynx can summarize the session
+        and stop the model server cleanly.
         """
         if self.shutting_down:
             event.accept()
             return
 
         event.ignore()
-        self.kill_lynx()
+        self.append_system_message("Use the Kill button to close Lynx safely.")
 
 
 def main() -> None:

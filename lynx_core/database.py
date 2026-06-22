@@ -3,8 +3,11 @@ database.py
 
 SQLite database layer for Lynx.
 
-This module stores raw conversations and messages permanently.
-It does not perform summarization or intelligent memory extraction yet.
+This module stores:
+- raw conversations
+- raw messages
+- conversation summaries
+- external web source summaries
 """
 
 import sqlite3
@@ -13,39 +16,12 @@ from pathlib import Path
 
 
 def current_timestamp() -> str:
-    """
-    Return current local timestamp as ISO-like text.
-    """
+    """Return current local timestamp as ISO-like text."""
     return datetime.now().isoformat(timespec="seconds")
 
 
 class LynxDatabase:
-    def save_conversation_summary(self, conversation_id: int, summary: str) -> int:
-        """
-        Save a summary for a conversation.
-        """
-
-        cursor = self.connection.execute(
-            """
-            INSERT INTO conversation_summaries
-                (conversation_id, summary, created_at)
-            VALUES (?, ?, ?);
-            """,
-            (conversation_id, summary, current_timestamp()),
-        )
-
-        self.connection.commit()
-        return int(cursor.lastrowid)
-
     def __init__(self, db_path: Path | None = None):
-        """
-        Create a LynxDatabase object.
-
-        db_path:
-            Optional custom path for the SQLite database.
-            If not provided, Lynx uses ~/lynx/data/lynx.db
-        """
-
         if db_path is None:
             db_path = Path.home() / "lynx" / "data" / "lynx.db"
 
@@ -59,16 +35,9 @@ class LynxDatabase:
         self._create_tables()
 
     def _enable_foreign_keys(self) -> None:
-        """
-        Enable SQLite foreign key enforcement.
-        """
         self.connection.execute("PRAGMA foreign_keys = ON;")
 
     def _create_tables(self) -> None:
-        """
-        Create database tables if they do not already exist.
-        """
-
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS conversations (
@@ -113,6 +82,25 @@ class LynxDatabase:
 
         self.connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS web_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                source_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT,
+                query TEXT,
+                summary TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+
+                FOREIGN KEY (conversation_id)
+                    REFERENCES conversations (id)
+                    ON DELETE SET NULL
+            );
+            """
+        )
+
+        self.connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
             ON messages (conversation_id);
             """
@@ -125,13 +113,30 @@ class LynxDatabase:
             """
         )
 
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_id
+            ON conversation_summaries (conversation_id);
+            """
+        )
+
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_web_sources_conversation_id
+            ON web_sources (conversation_id);
+            """
+        )
+
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_web_sources_source_type
+            ON web_sources (source_type);
+            """
+        )
+
         self.connection.commit()
 
     def start_conversation(self, title: str | None = None) -> int:
-        """
-        Start a new conversation and return its ID.
-        """
-
         if title is None:
             title = "Untitled conversation"
 
@@ -147,10 +152,6 @@ class LynxDatabase:
         return int(cursor.lastrowid)
 
     def end_conversation(self, conversation_id: int) -> None:
-        """
-        Mark a conversation as ended.
-        """
-
         self.connection.execute(
             """
             UPDATE conversations
@@ -159,19 +160,9 @@ class LynxDatabase:
             """,
             (current_timestamp(), conversation_id),
         )
-
         self.connection.commit()
 
     def save_message(self, conversation_id: int, role: str, content: str) -> int:
-        """
-        Save one message to the database.
-
-        role should normally be:
-            "user"
-            "assistant"
-            "system"
-        """
-
         if role not in {"user", "assistant", "system"}:
             raise ValueError(f"Invalid message role: {role}")
 
@@ -186,11 +177,51 @@ class LynxDatabase:
         self.connection.commit()
         return int(cursor.lastrowid)
 
-    def get_conversation_messages(self, conversation_id: int) -> list[dict[str, str]]:
-        """
-        Return all messages from a conversation.
-        """
+    def save_conversation_summary(self, conversation_id: int, summary: str) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO conversation_summaries
+                (conversation_id, summary, created_at)
+            VALUES (?, ?, ?);
+            """,
+            (conversation_id, summary, current_timestamp()),
+        )
 
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def save_web_source(
+        self,
+        source_type: str,
+        title: str,
+        summary: str,
+        url: str | None = None,
+        query: str | None = None,
+        conversation_id: int | None = None,
+    ) -> int:
+        """Save an external web source summary."""
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO web_sources
+                (conversation_id, source_type, title, url, query, summary, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                conversation_id,
+                source_type,
+                title,
+                url,
+                query,
+                summary,
+                current_timestamp(),
+            ),
+        )
+
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def get_conversation_messages(self, conversation_id: int) -> list[dict[str, str]]:
         cursor = self.connection.execute(
             """
             SELECT role, content, created_at
@@ -209,49 +240,8 @@ class LynxDatabase:
             }
             for row in cursor.fetchall()
         ]
-    def list_recent_summaries(self, limit: int = 30) -> list[dict]:
-        """
-        Return recent conversation summaries.
 
-        These summaries are used as an index for deciding which old
-        conversations may be relevant to the current user message.
-        """
-
-        cursor = self.connection.execute(
-            """
-            SELECT
-                conversation_summaries.id AS summary_id,
-                conversation_summaries.conversation_id AS conversation_id,
-                conversation_summaries.summary AS summary,
-                conversation_summaries.created_at AS created_at,
-                conversations.title AS conversation_title,
-                conversations.started_at AS conversation_started_at
-            FROM conversation_summaries
-            JOIN conversations
-                ON conversation_summaries.conversation_id = conversations.id
-            ORDER BY conversation_summaries.id DESC
-            LIMIT ?;
-            """,
-            (limit,),
-        )
-
-        return [
-            {
-                "summary_id": row["summary_id"],
-                "conversation_id": row["conversation_id"],
-                "summary": row["summary"],
-                "created_at": row["created_at"],
-                "conversation_title": row["conversation_title"],
-                "conversation_started_at": row["conversation_started_at"],
-            }
-            for row in cursor.fetchall()
-        ]
-
-    def list_recent_conversations(self, limit: int = 10) -> list[dict[str, str]]:
-        """
-        Return recent conversations.
-        """
-
+    def list_recent_conversations(self, limit: int = 10) -> list[dict]:
         cursor = self.connection.execute(
             """
             SELECT id, title, started_at, ended_at
@@ -271,11 +261,8 @@ class LynxDatabase:
             }
             for row in cursor.fetchall()
         ]
-    def list_recent_summaries(self, limit: int = 30) -> list[dict]:
-        """
-        Return recent conversation summaries.
-        """
 
+    def list_recent_summaries(self, limit: int = 30) -> list[dict]:
         cursor = self.connection.execute(
             """
             SELECT
@@ -305,8 +292,39 @@ class LynxDatabase:
             }
             for row in cursor.fetchall()
         ]
+
+    def list_recent_web_sources(self, limit: int = 20) -> list[dict]:
+        cursor = self.connection.execute(
+            """
+            SELECT
+                id,
+                conversation_id,
+                source_type,
+                title,
+                url,
+                query,
+                summary,
+                fetched_at
+            FROM web_sources
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+
+        return [
+            {
+                "id": row["id"],
+                "conversation_id": row["conversation_id"],
+                "source_type": row["source_type"],
+                "title": row["title"],
+                "url": row["url"],
+                "query": row["query"],
+                "summary": row["summary"],
+                "fetched_at": row["fetched_at"],
+            }
+            for row in cursor.fetchall()
+        ]
+
     def close(self) -> None:
-        """
-        Close the database connection.
-        """
         self.connection.close()
