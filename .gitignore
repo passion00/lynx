@@ -30,3 +30,6 @@ data/
 *.db-shm
 *.db-journal
 backups/
+
+# Lynx playground outputs
+playground/
