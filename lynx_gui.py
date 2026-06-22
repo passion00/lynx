@@ -16,6 +16,8 @@ It uses existing lynx_core modules:
 - database.py
 - memory_retriever.py
 - conversation_summarizer.py
+- wikipedia_tool.py
+- fact_extractor.py
 """
 
 import sys
@@ -38,6 +40,7 @@ from lynx_core.active_memory import ActiveMemory
 from lynx_core.database import LynxDatabase
 from lynx_core.memory_retriever import retrieve_relevant_context
 from lynx_core.conversation_summarizer import summarize_and_store_current_conversation
+from lynx_core.fact_extractor import extract_and_store_facts
 from lynx_core.model_server import (
     CHAT_URL,
     MODEL_NAME,
@@ -135,11 +138,14 @@ class SendMessageWorker(QObject):
     """
     Handles one user message in a background thread.
 
-    This worker uses its own database connection for memory retrieval.
-    The main GUI thread saves user/assistant messages to the current conversation.
+    Order of operations:
+    1. Extract durable facts from the latest user message and save them.
+    2. Retrieve relevant memory, checking facts first.
+    3. Fetch Wikipedia context if explicitly requested.
+    4. Ask the model for the assistant response.
     """
 
-    finished = Signal(str)
+    finished = Signal(str, int)
     error = Signal(str)
 
     def __init__(
@@ -147,16 +153,25 @@ class SendMessageWorker(QObject):
         user_message: str,
         active_messages: list[dict[str, str]],
         conversation_id: int,
+        current_message_id: int | None,
     ):
         super().__init__()
         self.user_message = user_message
         self.active_messages = active_messages
         self.conversation_id = conversation_id
+        self.current_message_id = current_message_id
 
     def run(self) -> None:
         try:
             # Use a separate SQLite connection in this worker thread.
             db = LynxDatabase()
+
+            extracted_facts = extract_and_store_facts(
+                db=db,
+                user_message=self.user_message,
+                conversation_id=self.conversation_id,
+                source_message_id=self.current_message_id,
+            )
 
             wikipedia_context = ""
             wikipedia_query = extract_wikipedia_query(self.user_message)
@@ -184,6 +199,7 @@ class SendMessageWorker(QObject):
                 db=db,
                 user_message=self.user_message,
                 summary_limit=30,
+                current_message_id=self.current_message_id,
             )
 
             db.close()
@@ -195,7 +211,7 @@ class SendMessageWorker(QObject):
             )
 
             answer = ask_model(messages_for_model)
-            self.finished.emit(answer)
+            self.finished.emit(answer, len(extracted_facts))
 
         except Exception as error:
             self.error.emit(str(error))
@@ -368,7 +384,7 @@ class LynxMainWindow(QMainWindow):
 
         self.input_box.clear()
         self.set_input_enabled(False)
-        self.status_label.setText("Lynx is thinking...")
+        self.status_label.setText("Lynx is extracting facts and thinking...")
 
         self.append_user_message(user_message)
 
@@ -380,8 +396,14 @@ class LynxMainWindow(QMainWindow):
             }
         )
 
+        user_message_id: int | None = None
+
         try:
-            self.db.save_message(self.conversation_id, "user", user_message)
+            user_message_id = self.db.save_message(
+                self.conversation_id,
+                "user",
+                user_message,
+            )
         except Exception as error:
             self.append_error_message(f"Could not save user message: {error}")
 
@@ -392,6 +414,7 @@ class LynxMainWindow(QMainWindow):
             user_message=user_message,
             active_messages=active_messages,
             conversation_id=self.conversation_id,
+            current_message_id=user_message_id,
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -407,7 +430,7 @@ class LynxMainWindow(QMainWindow):
 
         self.worker_thread.start()
 
-    def on_answer_ready(self, answer: str) -> None:
+    def on_answer_ready(self, answer: str, facts_extracted_count: int = 0) -> None:
         self.memory.add_assistant_message(answer)
         self.session_messages_for_summary.append(
             {
@@ -422,6 +445,12 @@ class LynxMainWindow(QMainWindow):
             self.append_error_message(f"Could not save assistant message: {error}")
 
         self.append_lynx_message(answer)
+
+        if facts_extracted_count > 0:
+            self.append_system_message(
+                f"Saved {facts_extracted_count} durable fact(s) to memory."
+            )
+
         self.status_label.setText("Ready.")
         self.set_input_enabled(True)
         self.input_box.setFocus()

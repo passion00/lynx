@@ -1,306 +1,212 @@
 """
 memory_retriever.py
 
-Simple automatic memory retrieval for Lynx.
+Tiered memory retrieval for Lynx.
 
-Design:
-- Use saved conversation summaries as an index.
-- Score summaries locally in Python.
-- Load full chat history only for the most relevant conversations.
-- Ask the model to distill useful context.
-- Return that context so lynx.py can inject it before answering.
+Retrieval order:
+1. durable facts table
+2. conversation summaries, newest to oldest
+3. raw messages, newest to oldest
 
-No commands.
-No manual recall.
-No JSON selection step.
+The function stops as soon as it finds relevant context at a cheaper layer.
 """
 
+from __future__ import annotations
+
 import re
+from typing import Iterable
 
-import requests
-
-from lynx_core.model_server import CHAT_URL, MODEL_NAME
-
-
-DISTILLATION_SYSTEM_PROMPT = """
-You are Lynx's memory distiller.
-
-You will receive:
-1. The user's current message.
-2. Summaries and old chat history from previous Lynx conversations.
-
-Your job is NOT to answer the user.
-Your job is to extract useful remembered context for the main assistant.
-
-Rules:
-- Extract only information relevant to the user's current message.
-- If the user asks "Who am I?", include identity/profile/project facts about the user.
-- Preserve names, project names, decisions, preferences, and technical context.
-- Be concise.
-- Do not invent facts.
-- If no useful memory exists, return exactly: EMPTY
-""".strip()
+from lynx_core.database import LynxDatabase
 
 
-def tokenize(text: str) -> set[str]:
-    """
-    Convert text into lowercase searchable tokens.
-    """
-    return set(re.findall(r"[a-zA-Z0-9_ğüşöçıİĞÜŞÖÇ]+", text.lower()))
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can",
+    "do", "does", "for", "from", "had", "has", "have", "he", "her", "his",
+    "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+    "she", "so", "that", "the", "their", "there", "they", "this", "to", "was",
+    "we", "what", "when", "where", "which", "who", "why", "will", "with", "you",
+    "your", "user", "users", "s",
+}
+
+SYNONYMS = {
+    "name": {"name", "named", "called"},
+    "named": {"name", "named", "called"},
+    "called": {"name", "named", "called"},
+    "father": {"father", "dad", "parent"},
+    "dad": {"father", "dad", "parent"},
+    "mother": {"mother", "mom", "mum", "parent"},
+    "mom": {"mother", "mom", "mum", "parent"},
+    "cat": {"cat", "pet"},
+    "pet": {"cat", "pet"},
+    "lynx": {"lynx", "project", "assistant"},
+    "project": {"lynx", "project", "assistant"},
+}
 
 
-def is_identity_question(text: str) -> bool:
-    """
-    Detect questions like:
-    - Who am I?
-    - What do you know about me?
-    - Do you remember me?
-    """
+def tokenize(text: str) -> list[str]:
+    """Tokenize text for simple relevance scoring."""
 
-    lowered = text.lower().strip()
+    lowered = text.lower().replace("’", "'")
+    raw_tokens = re.findall(r"[a-zA-Z0-9_çğıöşüÇĞİÖŞÜ']+", lowered)
 
-    identity_phrases = [
-        "who am i",
-        "who i am",
-        "what do you know about me",
-        "do you remember me",
-        "remember me",
-        "my name",
-        "about me",
-        "tell me about myself",
-        "beni hatırlıyor musun",
-        "ben kimim",
-    ]
-
-    return any(phrase in lowered for phrase in identity_phrases)
-
-
-def expanded_query_tokens(user_message: str) -> set[str]:
-    """
-    Add helpful search terms based on the kind of user message.
-    """
-
-    tokens = tokenize(user_message)
-
-    if is_identity_question(user_message):
-        tokens.update(
-            {
-                "user",
-                "name",
-                "identity",
-                "profile",
-                "pseudonym",
-                "orion",
-                "virel",
-                "lynx",
-                "assistant",
-                "project",
-                "building",
-                "local",
-            }
-        )
+    tokens: list[str] = []
+    for token in raw_tokens:
+        token = token.strip("'")
+        if token.endswith("'s"):
+            token = token[:-2]
+        if not token:
+            continue
+        if token in STOPWORDS:
+            continue
+        tokens.append(token)
 
     return tokens
 
 
-def score_summary(user_message: str, summary: str) -> int:
-    """
-    Score how relevant a summary is to the current user message.
+def expand_tokens(tokens: Iterable[str]) -> set[str]:
+    """Expand query tokens with small synonym groups."""
 
-    This is intentionally simple and deterministic.
-    """
+    expanded: set[str] = set()
 
-    query_tokens = expanded_query_tokens(user_message)
-    summary_tokens = tokenize(summary)
+    for token in tokens:
+        expanded.add(token)
+        if token in SYNONYMS:
+            expanded.update(SYNONYMS[token])
+        if token.endswith("s") and len(token) > 3:
+            expanded.add(token[:-1])
+        if token.endswith("ed") and len(token) > 4:
+            expanded.add(token[:-2])
 
-    score = 0
+    return expanded
 
-    for token in query_tokens:
-        if token in summary_tokens:
-            score += 2
 
-    lowered_summary = summary.lower()
+def relevance_score(query: str, text: str) -> int:
+    """Return a simple relevance score between the query and a candidate text."""
 
-    if is_identity_question(user_message):
-        identity_markers = [
-            "user",
-            "name",
-            "orion",
-            "virel",
-            "profile",
-            "pseudonym",
-            "building lynx",
-            "local ai assistant",
-        ]
+    query_tokens = expand_tokens(tokenize(query))
+    text_tokens = expand_tokens(tokenize(text))
 
-        for marker in identity_markers:
-            if marker in lowered_summary:
-                score += 5
+    if not query_tokens or not text_tokens:
+        return 0
+
+    score = len(query_tokens & text_tokens)
+
+    lowered_query = query.lower()
+    lowered_text = text.lower()
+
+    # Useful phrase boosts for common memory questions.
+    if "father" in query_tokens and "father" in text_tokens:
+        score += 2
+    if "mother" in query_tokens and "mother" in text_tokens:
+        score += 2
+    if "name" in query_tokens and ({"name", "named", "called"} & text_tokens):
+        score += 2
+    if "lynx" in query_tokens and "lynx" in text_tokens:
+        score += 2
+    if "who am i" in lowered_query and ("orion" in lowered_text or "virel" in lowered_text):
+        score += 4
 
     return score
 
 
-def select_relevant_summaries(
+def first_relevant_fact(
+    db: LynxDatabase,
     user_message: str,
-    summaries: list[dict],
-    max_results: int = 3,
-) -> list[dict]:
-    """
-    Select the most relevant saved summaries.
+    fact_limit: int = 200,
+) -> dict | None:
+    """Scan active facts from newest to oldest and return the first relevant fact."""
 
-    If the user asks an identity/profile question and scores are weak,
-    fall back to recent summaries. This helps Lynx discover profile info
-    from a fresh database.
-    """
+    for fact in db.list_active_facts(limit=fact_limit):
+        if relevance_score(user_message, fact["fact"]) > 0:
+            return fact
 
-    scored = []
-
-    for summary_item in summaries:
-        score = score_summary(user_message, summary_item["summary"])
-        scored.append((score, summary_item))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-
-    selected = [item for score, item in scored if score > 0][:max_results]
-
-    if selected:
-        return selected
-
-    # Identity questions are special: "Who am I?" has few keywords.
-    # If no score matched, inspect a few recent summaries anyway.
-    if is_identity_question(user_message):
-        return summaries[:max_results]
-
-    return []
+    return None
 
 
-def format_chat_history(messages: list[dict[str, str]], max_chars: int = 12000) -> str:
-    """
-    Convert old database messages into readable text.
-    """
+def first_relevant_summary(
+    db: LynxDatabase,
+    user_message: str,
+    summary_limit: int = 50,
+) -> dict | None:
+    """Scan summaries from newest to oldest and return the first relevant summary."""
 
-    parts = []
+    for summary in db.list_recent_summaries(limit=summary_limit):
+        if relevance_score(user_message, summary["summary"]) > 0:
+            return summary
 
-    for message in messages:
-        role = message["role"].upper()
-        content = message["content"].strip()
+    return None
 
-        if not content:
+
+def first_relevant_raw_message(
+    db: LynxDatabase,
+    user_message: str,
+    message_limit: int = 500,
+    current_message_id: int | None = None,
+) -> dict | None:
+    """Scan raw messages from newest to oldest and return the first relevant message."""
+
+    for message in db.list_recent_messages(limit=message_limit):
+        if current_message_id is not None and message["message_id"] == current_message_id:
             continue
+        if relevance_score(user_message, message["content"]) > 0:
+            return message
 
-        parts.append(f"{role}:\n{content}")
-
-    text = "\n\n".join(parts)
-
-    if len(text) <= max_chars:
-        return text
-
-    return (
-        "[Earlier part omitted because the conversation was long.]\n\n"
-        + text[-max_chars:]
-    )
-
-
-def ask_model_for_distillation(
-    user_message: str,
-    memory_text: str,
-    max_tokens: int = 350,
-) -> str:
-    """
-    Ask the model to distill useful context from retrieved memory.
-    """
-
-    prompt = f"""
-User's current message:
-{user_message}
-
-Retrieved previous memory:
-{memory_text}
-""".strip()
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "system",
-                "content": DISTILLATION_SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-    }
-
-    response = requests.post(CHAT_URL, json=payload, timeout=None)
-    response.raise_for_status()
-
-    data = response.json()
-
-    try:
-        distilled = data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError) as error:
-        raise RuntimeError(f"Unexpected model response format: {data}") from error
-
-    if distilled.upper() == "EMPTY":
-        return ""
-
-    return distilled
+    return None
 
 
 def retrieve_relevant_context(
-    db,
+    db: LynxDatabase,
     user_message: str,
-    summary_limit: int = 30,
+    summary_limit: int = 50,
+    fact_limit: int = 200,
+    message_limit: int = 500,
+    current_message_id: int | None = None,
 ) -> str:
     """
-    Retrieve useful remembered context for the user's current message.
+    Retrieve memory context for the current user message.
 
-    Returns:
-        A concise context string, or "" if nothing useful was found.
+    The search stops at the first memory layer that produces a relevant result:
+    facts, then summaries, then raw messages.
     """
 
-    summaries = db.list_recent_summaries(limit=summary_limit)
-
-    if not summaries:
-        return ""
-
-    selected_summaries = select_relevant_summaries(
+    relevant_fact = first_relevant_fact(
+        db=db,
         user_message=user_message,
-        summaries=summaries,
-        max_results=3,
+        fact_limit=fact_limit,
     )
 
-    if not selected_summaries:
-        return ""
+    if relevant_fact is not None:
+        return (
+            "Relevant durable fact found in Lynx memory: "
+            f"{relevant_fact['fact']}"
+        )
 
-    memory_blocks = []
-
-    for item in selected_summaries:
-        conversation_id = item["conversation_id"]
-
-        messages = db.get_conversation_messages(conversation_id)
-        chat_history = format_chat_history(messages)
-
-        block = f"""
-Conversation ID: {conversation_id}
-Conversation started at: {item["conversation_started_at"]}
-
-Saved summary:
-{item["summary"]}
-
-Full chat history:
-{chat_history}
-""".strip()
-
-        memory_blocks.append(block)
-
-    memory_text = "\n\n====================\n\n".join(memory_blocks)
-
-    return ask_model_for_distillation(
+    relevant_summary = first_relevant_summary(
+        db=db,
         user_message=user_message,
-        memory_text=memory_text,
-        max_tokens=350,
+        summary_limit=summary_limit,
     )
+
+    if relevant_summary is not None:
+        return (
+            "Relevant conversation summary found in Lynx memory: "
+            f"Conversation ID {relevant_summary['conversation_id']}. "
+            f"Summary: {relevant_summary['summary']}"
+        )
+
+    relevant_message = first_relevant_raw_message(
+        db=db,
+        user_message=user_message,
+        message_limit=message_limit,
+        current_message_id=current_message_id,
+    )
+
+    if relevant_message is not None:
+        return (
+            "Relevant raw chat message found in Lynx memory: "
+            f"Conversation ID {relevant_message['conversation_id']}, "
+            f"role {relevant_message['role']}. "
+            f"Message: {relevant_message['content']}"
+        )
+
+    return ""

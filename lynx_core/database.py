@@ -8,7 +8,10 @@ This module stores:
 - raw messages
 - conversation summaries
 - external web source summaries
+- durable extracted facts
 """
+
+from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
@@ -101,36 +104,74 @@ class LynxDatabase:
 
         self.connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT,
+                fact TEXT NOT NULL,
+                source_conversation_id INTEGER,
+                source_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                confidence REAL DEFAULT 1.0,
+                is_active INTEGER DEFAULT 1,
+
+                FOREIGN KEY (source_conversation_id)
+                    REFERENCES conversations (id)
+                    ON DELETE SET NULL,
+
+                FOREIGN KEY (source_message_id)
+                    REFERENCES messages (id)
+                    ON DELETE SET NULL
+            );
+            """
+        )
+
+        self.connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
             ON messages (conversation_id);
             """
         )
-
         self.connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_messages_created_at
             ON messages (created_at);
             """
         )
-
         self.connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_id
             ON conversation_summaries (conversation_id);
             """
         )
-
         self.connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_web_sources_conversation_id
             ON web_sources (conversation_id);
             """
         )
-
         self.connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_web_sources_source_type
             ON web_sources (source_type);
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_facts_is_active
+            ON facts (is_active);
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_facts_created_at
+            ON facts (created_at);
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_facts_category
+            ON facts (category);
             """
         )
 
@@ -147,7 +188,6 @@ class LynxDatabase:
             """,
             (title, current_timestamp()),
         )
-
         self.connection.commit()
         return int(cursor.lastrowid)
 
@@ -173,7 +213,6 @@ class LynxDatabase:
             """,
             (conversation_id, role, content, current_timestamp()),
         )
-
         self.connection.commit()
         return int(cursor.lastrowid)
 
@@ -186,7 +225,6 @@ class LynxDatabase:
             """,
             (conversation_id, summary, current_timestamp()),
         )
-
         self.connection.commit()
         return int(cursor.lastrowid)
 
@@ -217,11 +255,106 @@ class LynxDatabase:
                 current_timestamp(),
             ),
         )
-
         self.connection.commit()
         return int(cursor.lastrowid)
 
-    def get_conversation_messages(self, conversation_id: int) -> list[dict[str, str]]:
+    def save_fact(
+        self,
+        fact: str,
+        category: str | None = None,
+        source_conversation_id: int | None = None,
+        source_message_id: int | None = None,
+        confidence: float = 1.0,
+    ) -> int | None:
+        """
+        Save a durable fact.
+
+        Duplicate active facts are ignored using a case-insensitive exact match.
+        Returns the new row id, or None if the fact already exists.
+        """
+
+        clean_fact = " ".join((fact or "").split()).strip()
+        if not clean_fact:
+            return None
+
+        existing = self.connection.execute(
+            """
+            SELECT id
+            FROM facts
+            WHERE is_active = 1
+              AND lower(fact) = lower(?)
+            LIMIT 1;
+            """,
+            (clean_fact,),
+        ).fetchone()
+
+        if existing is not None:
+            return None
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO facts
+                (category, fact, source_conversation_id, source_message_id,
+                 created_at, updated_at, confidence, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1);
+            """,
+            (
+                category,
+                clean_fact,
+                source_conversation_id,
+                source_message_id,
+                current_timestamp(),
+                current_timestamp(),
+                confidence,
+            ),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def list_active_facts(self, limit: int = 200) -> list[dict]:
+        """Return active facts from newest to oldest."""
+
+        cursor = self.connection.execute(
+            """
+            SELECT
+                id,
+                category,
+                fact,
+                source_conversation_id,
+                source_message_id,
+                created_at,
+                updated_at,
+                confidence,
+                is_active
+            FROM facts
+            WHERE is_active = 1
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def list_recent_messages(self, limit: int = 500) -> list[dict]:
+        """Return recent raw messages from newest to oldest."""
+
+        cursor = self.connection.execute(
+            """
+            SELECT
+                id AS message_id,
+                conversation_id,
+                role,
+                content,
+                created_at
+            FROM messages
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_conversation_messages(self, conversation_id: int) -> list[dict]:
         cursor = self.connection.execute(
             """
             SELECT role, content, created_at
@@ -231,15 +364,7 @@ class LynxDatabase:
             """,
             (conversation_id,),
         )
-
-        return [
-            {
-                "role": row["role"],
-                "content": row["content"],
-                "created_at": row["created_at"],
-            }
-            for row in cursor.fetchall()
-        ]
+        return [dict(row) for row in cursor.fetchall()]
 
     def list_recent_conversations(self, limit: int = 10) -> list[dict]:
         cursor = self.connection.execute(
@@ -251,16 +376,7 @@ class LynxDatabase:
             """,
             (limit,),
         )
-
-        return [
-            {
-                "id": row["id"],
-                "title": row["title"],
-                "started_at": row["started_at"],
-                "ended_at": row["ended_at"],
-            }
-            for row in cursor.fetchall()
-        ]
+        return [dict(row) for row in cursor.fetchall()]
 
     def list_recent_summaries(self, limit: int = 30) -> list[dict]:
         cursor = self.connection.execute(
@@ -274,24 +390,13 @@ class LynxDatabase:
                 conversations.started_at AS conversation_started_at
             FROM conversation_summaries
             JOIN conversations
-                ON conversation_summaries.conversation_id = conversations.id
+                ON conversations.id = conversation_summaries.conversation_id
             ORDER BY conversation_summaries.id DESC
             LIMIT ?;
             """,
             (limit,),
         )
-
-        return [
-            {
-                "summary_id": row["summary_id"],
-                "conversation_id": row["conversation_id"],
-                "summary": row["summary"],
-                "created_at": row["created_at"],
-                "conversation_title": row["conversation_title"],
-                "conversation_started_at": row["conversation_started_at"],
-            }
-            for row in cursor.fetchall()
-        ]
+        return [dict(row) for row in cursor.fetchall()]
 
     def list_recent_web_sources(self, limit: int = 20) -> list[dict]:
         cursor = self.connection.execute(
@@ -311,20 +416,7 @@ class LynxDatabase:
             """,
             (limit,),
         )
-
-        return [
-            {
-                "id": row["id"],
-                "conversation_id": row["conversation_id"],
-                "source_type": row["source_type"],
-                "title": row["title"],
-                "url": row["url"],
-                "query": row["query"],
-                "summary": row["summary"],
-                "fetched_at": row["fetched_at"],
-            }
-            for row in cursor.fetchall()
-        ]
+        return [dict(row) for row in cursor.fetchall()]
 
     def close(self) -> None:
         self.connection.close()
